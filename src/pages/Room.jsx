@@ -22,6 +22,7 @@ function Room() {
   const { roomId } = useParams();
   const navigate = useNavigate();
 const [roomLoading, setRoomLoading] = useState(true);
+const [remoteQueueReady, setRemoteQueueReady] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [room, setRoom] = useState(null);
 
@@ -127,8 +128,9 @@ useEffect(() => {
 
     async function syncRemoteQueue() {
       const remoteQueue = roomState?.queue;
-
       if (!Array.isArray(remoteQueue)) return;
+
+setRemoteQueueReady(false);
 
       try {
         const localTracks = audio.queue || [];
@@ -160,7 +162,11 @@ useEffect(() => {
 
         const validTracks = tracksWithUrls.filter(Boolean);
 
-        audio.applyRemoteQueue(validTracks);
+await audio.applyRemoteQueue(validTracks);
+
+if (!cancelled) {
+  setRemoteQueueReady(true);
+}
       } catch (error) {
         if (!cancelled) {
           showToast(
@@ -181,12 +187,13 @@ useEffect(() => {
   }, [roomState?.queue, roomId]);
 
   // Apply playback updates received from other listeners.
-  useEffect(() => {
-    if (!roomState?.playback) return;
+   // Restore playback only after the saved queue is ready.
+useEffect(() => {
+  if (!remoteQueueReady || !roomState?.playback) return;
 
-    audio.applyRemotePlayback(roomState.playback);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [roomState?.playback]);
+  void audio.applyRemotePlayback(roomState.playback);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+}, [roomState?.playback, remoteQueueReady]);
 
   const listeners = (onlineListeners || []).map((listener) => ({
     ...listener,

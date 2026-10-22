@@ -1,8 +1,10 @@
 
+import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import { createServer } from "http";
 import { Server } from "socket.io";
+import { createClient } from "@supabase/supabase-js";
 
 const app = express();
 const httpServer = createServer(app);
@@ -27,6 +29,7 @@ app.use(
     },
   })
 );
+
 app.use(express.json());
 
 app.get("/", (_req, res) => {
@@ -36,6 +39,18 @@ app.get("/", (_req, res) => {
 app.get("/health", (_req, res) => {
   res.json({ status: "ok" });
 });
+
+// Supabase backend connection
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+if (!supabaseUrl || !supabaseKey) {
+  throw new Error(
+    "Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY environment variable."
+  );
+}
+
+const supabase = createClient(supabaseUrl, supabaseKey);
 
 const io = new Server(httpServer, {
   cors: {
@@ -57,13 +72,13 @@ function createRoom(roomId, details = {}) {
     id: roomId,
     name: details.roomName || details.name || roomId,
     host: details.host || "Music Lover",
-    hostId: details.hostId || "local-user",
+    hostId: details.hostId || details.host_id || "local-user",
     description: details.description || "",
     privacy: details.privacy || "public",
-    maxListeners: details.maxListeners || 10,
+    maxListeners: details.maxListeners || details.max_listeners || 10,
     listeners: [],
-    queue: [],
-    playback: {
+    queue: Array.isArray(details.queue) ? details.queue : [],
+    playback: details.playback || {
       trackId: null,
       currentTime: 0,
       isPlaying: false,
@@ -89,151 +104,253 @@ function getPublicRoomState(room) {
   };
 }
 
+// Save persistent room data; live listeners are not stored.
+async function saveRoom(room) {
+    console.log("Saving room to Supabase:", room.id);
+  const { error } = await supabase
+    .from("syncroom_rooms")
+    .upsert(
+      {
+        id: room.id,
+        name: room.name,
+        host: room.host,
+        host_id: room.hostId,
+        description: room.description,
+        privacy: room.privacy,
+        max_listeners: room.maxListeners,
+        queue: room.queue,
+        playback: room.playback,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: "id" }
+    );
+
+  if (error) {
+    console.error("Failed to save room:", room.id, error.message);
+    throw error;
+  }
+}
+
+// Restore rooms after a server restart.
+async function loadRooms() {
+  const { data, error } = await supabase
+    .from("syncroom_rooms")
+    .select("*");
+
+  if (error) {
+    throw new Error(`Failed to load rooms: ${error.message}`);
+  }
+
+  for (const savedRoom of data || []) {
+    const room = createRoom(savedRoom.id, savedRoom);
+    rooms.set(room.id, room);
+  }
+
+  console.log(`Restored ${rooms.size} rooms from Supabase.`);
+}
+
+const roomsReady = loadRooms();
+
+// Send room state to everyone in the room.
 function broadcastRoomState(room) {
   io.to(room.id).emit("room:state", getPublicRoomState(room));
 }
 
-app.get("/api/rooms/:roomId", (req, res) => {
-  const room = rooms.get(req.params.roomId);
+// Fetch a room, including rooms restored from Supabase.
+app.get("/api/rooms/:roomId", async (req, res) => {
+  try {
+    await roomsReady;
 
-  if (!room) {
-    return res.status(404).json({ error: "Room not found." });
+    const room = rooms.get(req.params.roomId);
+
+    if (!room) {
+      return res.status(404).json({ error: "Room not found." });
+    }
+
+    return res.json(getPublicRoomState(room));
+  } catch (error) {
+    console.error("Get room failed:", error.message);
+    return res.status(500).json({ error: "Failed to load room." });
   }
-
-  return res.json(getPublicRoomState(room));
 });
 
-app.post("/api/rooms", (req, res) => {
-  const { roomId, ...details } = req.body || {};
+// Create and persist a room.
+app.post("/api/rooms", async (req, res) => {
+  try {
+    await roomsReady;
 
-  if (!roomId) {
-    return res.status(400).json({ error: "Room ID is required." });
+    const { roomId, ...details } = req.body || {};
+
+    if (!roomId) {
+      return res.status(400).json({ error: "Room ID is required." });
+    }
+
+    if (rooms.has(roomId)) {
+      return res.status(409).json({ error: "Room already exists." });
+    }
+
+    const room = createRoom(roomId, details);
+
+    await saveRoom(room);
+    rooms.set(roomId, room);
+
+    return res.status(201).json(getPublicRoomState(room));
+  } catch (error) {
+    console.error("Create room failed:", error.message);
+    return res.status(500).json({ error: "Failed to create room." });
   }
-
-  if (rooms.has(roomId)) {
-    return res.status(409).json({ error: "Room already exists." });
-  }
-
-  const room = createRoom(roomId, details);
-  rooms.set(roomId, room);
-
-  return res.status(201).json(getPublicRoomState(room));
 });
 
 io.on("connection", (socket) => {
   console.log("Client connected:", socket.id);
 
-  socket.on("room:create", (payload = {}) => {
-    const roomId = payload.roomId;
+  socket.on("room:create", async (payload = {}) => {
+    console.log("ROOM CREATE EVENT RECEIVED:", payload);
+    try {
+      await roomsReady;
 
-    if (!roomId) {
-      socket.emit("room:error", "Room ID is required.");
-      return;
+      const roomId = payload.roomId;
+
+      if (!roomId) {
+        socket.emit("room:error", "Room ID is required.");
+        return;
+      }
+
+      let room = rooms.get(roomId);
+
+      if (!room) {
+        room = createRoom(roomId, payload);
+        await saveRoom(room);
+        rooms.set(roomId, room);
+      }
+
+      socket.join(roomId);
+
+      room.listeners = room.listeners.filter(
+        (listener) => listener.socketId !== socket.id
+      );
+
+      room.listeners.push({
+        id: payload.hostId || "local-user",
+        name: payload.host || "Music Lover",
+        socketId: socket.id,
+      });
+
+      socket.emit("room:created", getPublicRoomState(room));
+      broadcastRoomState(room);
+      io.to(roomId).emit("room:users", room.listeners);
+    } catch (error) {
+      console.error("Room creation failed:", error.message);
+      socket.emit("room:error", "Failed to create room. Please try again.");
     }
-
-    let room = rooms.get(roomId);
-
-    if (!room) {
-      room = createRoom(roomId, payload);
-      rooms.set(roomId, room);
-    }
-
-    socket.join(roomId);
-
-    room.listeners = room.listeners.filter(
-      (listener) => listener.socketId !== socket.id
-    );
-
-    room.listeners.push({
-      id: payload.hostId || "local-user",
-      name: payload.host || "Music Lover",
-      socketId: socket.id,
-    });
-
-    socket.emit("room:created", getPublicRoomState(room));
-    broadcastRoomState(room);
-    io.to(roomId).emit("room:users", room.listeners);
   });
 
-  socket.on("room:join", (payload = {}) => {
-    const { roomId, user = {} } = payload;
-    const room = rooms.get(roomId);
+  socket.on("room:join", async (payload = {}) => {
+    try {
+      await roomsReady;
 
-    if (!room) {
-      socket.emit("room:error", "Room not found.");
-      return;
+      const { roomId, user = {} } = payload;
+      const room = rooms.get(roomId);
+
+      if (!room) {
+        socket.emit("room:error", "Room not found.");
+        return;
+      }
+
+      const userId = user.id || "local-user";
+
+      room.listeners = room.listeners.filter(
+        (listener) => listener.socketId !== socket.id
+      );
+
+      if (room.listeners.length >= room.maxListeners) {
+        socket.emit("room:error", "This room has reached its listener limit.");
+        return;
+      }
+
+      socket.join(roomId);
+
+      room.listeners.push({
+        id: userId,
+        name: user.name || "Music Lover",
+        socketId: socket.id,
+      });
+
+      socket.emit("room:state", getPublicRoomState(room));
+      io.to(roomId).emit("room:users", room.listeners);
+    } catch (error) {
+      console.error("Room join failed:", error.message);
+      socket.emit("room:error", "Failed to join room. Please try again.");
     }
-
-    const userId = user.id || "local-user";
-
-    // Avoid duplicate entries for the same socket.
-    room.listeners = room.listeners.filter(
-      (listener) => listener.socketId !== socket.id
-    );
-
-    if (room.listeners.length >= room.maxListeners) {
-      socket.emit("room:error", "This room has reached its listener limit.");
-      return;
-    }
-
-    socket.join(roomId);
-
-    room.listeners.push({
-      id: userId,
-      name: user.name || "Music Lover",
-      socketId: socket.id,
-    });
-
-    socket.emit("room:state", getPublicRoomState(room));
-    io.to(roomId).emit("room:users", room.listeners);
   });
 
-    socket.on("playback:update", (payload = {}) => {
-  const room = rooms.get(payload.roomId);
-  if (!room) return;
+  socket.on("playback:update", async (payload = {}) => {
+    try {
+      await roomsReady;
 
-  const { roomId: _roomId, ...playbackUpdate } = payload;
+      const room = rooms.get(payload.roomId);
+      if (!room) return;
 
-  room.playback = {
-    ...room.playback,
-    ...playbackUpdate,
-    updatedAt: Date.now(),
-  };
+      const { roomId: _roomId, ...playbackUpdate } = payload;
 
-  socket.to(room.id).emit("playback:updated", room.playback);
-});
+      room.playback = {
+        ...room.playback,
+        ...playbackUpdate,
+        updatedAt: Date.now(),
+      };
 
-  socket.on("queue:update", (payload = {}) => {
-  const room = rooms.get(payload.roomId);
-  if (!room || !Array.isArray(payload.queue)) return;
+      // Keep existing real-time playback synchronization.
+      socket.to(room.id).emit("playback:updated", room.playback);
 
-  room.queue = payload.queue.map((track) => ({
-    id: track.id,
-    title: track.title || "Untitled",
-    artist: track.artist || "Unknown artist",
-    duration: track.duration || 0,
-    ...(track.storagePath ? { storagePath: track.storagePath } : {}),
-    ...(!track.storagePath && track.audioUrl
-      ? { audioUrl: track.audioUrl }
-      : {}),
-  }));
+      await saveRoom(room);
+    } catch (error) {
+      console.error("Playback persistence failed:", error.message);
+    }
+  });
 
-  io.to(room.id).emit("queue:updated", room.queue);
-});
+  socket.on("queue:update", async (payload = {}) => {
+    try {
+      await roomsReady;
+
+      const room = rooms.get(payload.roomId);
+      if (!room || !Array.isArray(payload.queue)) return;
+
+      room.queue = payload.queue.map((track) => ({
+        id: track.id,
+        title: track.title || "Untitled",
+        artist: track.artist || "Unknown artist",
+        duration: track.duration || 0,
+        ...(track.storagePath
+          ? { storagePath: track.storagePath }
+          : {}),
+        ...(!track.storagePath && track.audioUrl
+          ? { audioUrl: track.audioUrl }
+          : {}),
+      }));
+
+      io.to(room.id).emit("queue:updated", room.queue);
+
+      await saveRoom(room);
+    } catch (error) {
+      console.error("Queue persistence failed:", error.message);
+    }
+  });
+
   socket.on("room:leave", ({ roomId } = {}) => {
-  if (!roomId) return;
+    if (!roomId) return;
 
-  socket.leave(roomId);
+    socket.leave(roomId);
 
-  const room = rooms.get(roomId);
-  if (!room) return;
+    const room = rooms.get(roomId);
+    if (!room) return;
 
-  room.listeners = room.listeners.filter(
-    (listener) => listener.socketId !== socket.id
-  );
+    room.listeners = room.listeners.filter(
+      (listener) => listener.socketId !== socket.id
+    );
 
-  io.to(roomId).emit("room:users", room.listeners);
-});
+    io.to(roomId).emit("room:users", room.listeners);
+  });
+
   socket.on("disconnect", () => {
     console.log("Client disconnected:", socket.id);
 
@@ -251,6 +368,17 @@ io.on("connection", (socket) => {
   });
 });
 
-httpServer.listen(PORT, () => {
-  console.log(`SyncRoom server running on http://localhost:${PORT}`);
-});
+async function startServer() {
+  try {
+    await roomsReady;
+
+    httpServer.listen(PORT, () => {
+      console.log(`SyncRoom server running on port ${PORT}`);
+    });
+  } catch (error) {
+    console.error("Server startup failed:", error.message);
+    process.exit(1);
+  }
+}
+
+startServer();

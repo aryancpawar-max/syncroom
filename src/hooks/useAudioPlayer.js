@@ -412,95 +412,111 @@ function useAudioPlayer({
     }
   }, [publishQueue]);
 
-  const applyRemotePlayback = useCallback(async ({
-    trackId,
-    isPlaying: remoteIsPlaying,
-    currentTime: remoteTime,
-  } = {}) => {
-    const audio = audioRef.current;
-    if (!audio) return;
+    
+const applyRemotePlayback = useCallback(async ({
+  trackId,
+  isPlaying: remoteIsPlaying,
+  currentTime: remoteTime,
+} = {}) => {
+  const audio = audioRef.current;
+  if (!audio) return;
 
-    applyingRemoteRef.current = true;
+  applyingRemoteRef.current = true;
 
-    try {
-      // A null track ID means playback has stopped or been cleared.
-      if (!trackId) {
-        audio.pause();
-        setIsPlaying(false);
-        return;
-      }
+  try {
+    if (!trackId) {
+      audio.pause();
+      setIsPlaying(false);
+      currentIndexRef.current = -1;
+      setCurrentIndex(-1);
+      setTrack(null);
+      setCurrentTime(0);
+      return;
+    }
 
-      let index = queueRef.current.findIndex((item) => item.id === trackId);
+    const index = queueRef.current.findIndex(
+      (item) => item.id === trackId
+    );
 
-      if (index === -1) return;
+    // The queue may not have arrived yet. Don't erase the saved state.
+    if (index === -1) {
+      console.warn("Saved playback track is not in the queue yet:", trackId);
+      return;
+    }
 
-      let remoteTrack = queueRef.current[index];
-      let source = remoteTrack.audioUrl || remoteTrack.objectUrl;
+    let remoteTrack = queueRef.current[index];
+    let source = remoteTrack.audioUrl || remoteTrack.objectUrl || "";
 
-      if (remoteTrack.storagePath) {
-        try {
-          // Refresh the signed URL so long-running rooms keep working.
-          source = await createAudioSignedUrl(remoteTrack.storagePath);
+    if (remoteTrack.storagePath) {
+      source = await createAudioSignedUrl(remoteTrack.storagePath);
+    }
 
-          const refreshedQueue = queueRef.current.map((item) =>
-            item.id === trackId ? { ...item, audioUrl: source } : item
-          );
+    if (!source) {
+      setError("This track has no playable audio URL.");
+      return;
+    }
 
-          publishQueue(refreshedQueue, { remote: true });
-          remoteTrack = refreshedQueue[index];
-        } catch {
-          setError("Unable to access this track in Supabase Storage.");
+    const trackChanged =
+      currentIndexRef.current !== index ||
+      audio.dataset.trackId !== trackId;
+
+    if (trackChanged) {
+      audio.pause();
+      currentIndexRef.current = index;
+      setCurrentIndex(index);
+      setTrack({ ...remoteTrack, audioUrl: source });
+      audio.dataset.trackId = trackId;
+      audio.src = source;
+      audio.load();
+
+      await new Promise((resolve) => {
+        if (audio.readyState >= 1) {
+          resolve();
           return;
         }
+
+        audio.addEventListener("loadedmetadata", resolve, { once: true });
+        audio.addEventListener("error", resolve, { once: true });
+      });
+    }
+
+    if (Number.isFinite(remoteTime) && Number.isFinite(audio.duration)) {
+      const targetTime = Math.max(
+        0,
+        Math.min(remoteTime, audio.duration)
+      );
+
+      if (Math.abs(audio.currentTime - targetTime) > 1) {
+        audio.currentTime = targetTime;
       }
 
-      if (!source) {
-        setError("This track has no playable audio URL.");
+      setCurrentTime(audio.currentTime);
+    }
+
+    if (remoteIsPlaying) {
+      try {
+        await audio.play();
+      } catch {
+        // Browsers may block autoplay until the user interacts.
+        setIsPlaying(false);
+        setError("Press Play to resume the restored track.");
         return;
       }
-
-      if (
-        currentIndexRef.current !== index ||
-        audio.src !== source
-      ) {
-        currentIndexRef.current = index;
-        setCurrentIndex(index);
-        setTrack(remoteTrack);
-        setCurrentTime(0);
-        audio.src = source;
-        audio.load();
-
-        await new Promise((resolve) => {
-          if (audio.readyState >= 1) return resolve();
-
-          audio.addEventListener("loadedmetadata", resolve, { once: true });
-          audio.addEventListener("error", resolve, { once: true });
-        });
-      }
-
-      if (Number.isFinite(remoteTime) && Number.isFinite(audio.duration)) {
-        if (Math.abs(audio.currentTime - remoteTime) > 1.5) {
-          audio.currentTime = Math.max(
-            0,
-            Math.min(remoteTime, audio.duration)
-          );
-          setCurrentTime(audio.currentTime);
-        }
-      }
-
-      if (remoteIsPlaying && audio.paused) {
-        await audio.play();
-      } else if (!remoteIsPlaying && !audio.paused) {
-        audio.pause();
-      }
-
-      setError("");
-    } catch {
-      setError("Unable to synchronize playback.");
-    } finally {
-      applyingRemoteRef.current = false;
+    } else {
+      audio.pause();
     }
-  }, [publishQueue]);
+
+    setDuration(Number.isFinite(audio.duration) ? audio.duration : remoteTrack.duration || 0);
+    setIsPlaying(!audio.paused);
+    setError("");
+  } catch (err) {
+    console.error("Playback restoration failed:", err);
+    setError("Unable to restore playback. Please try again.");
+  } finally {
+    applyingRemoteRef.current = false;
+  }
+}, []);
+
 
   return {
     queue,
