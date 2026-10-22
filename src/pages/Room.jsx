@@ -289,9 +289,7 @@ useEffect(() => {
             <ListenerCount listeners={listeners} />
           </div>
 
-          <div className="mt-6">
-            <InviteLink roomId={room.id} />
-          </div>
+        
         </section>
 
         <div className="grid items-start gap-6 lg:grid-cols-[minmax(0,1fr)_340px]">
